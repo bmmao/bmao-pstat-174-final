@@ -1,0 +1,1108 @@
+---
+title: "Air Quality Index as Covariate in Predicting Deaths Due to Chronic Lower Respiratory Diseases per Month"
+author: "Brianna Mao \\ PSTAT 174"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.height = 3.5, fig.width = 10)
+
+library(tidyverse)
+library(readr)
+library(dplyr)
+library(knitr)
+library(kableExtra)
+library(ggplot2)
+library(lubridate)
+library(seasonal)
+library(tseries)
+library(forecast)
+library(GGally)
+library(dynlm)
+```
+
+\newpage
+
+## Summary
+Poor air quality is linked to poorer health, but it may be possible to know how many months of past air quality data are significant in observing the percentage of deaths due to chronic lower respiratory diseases in a month. The monthly death counts and daily air quality measures in Kern County and Los Angeles County in California are studied to find out which combination of months of air quality data produces the most accurate model for the monthly death amounts. The study found that the current month's air quality and the current and past one month's air quality are the most significant in affecting the percentage of deaths in a month. However, the models do not necessarily lend to good or accurate forecasts of future deaths given predictions of air quality.
+
+## Introduction
+The effects of pollution on health are often-studied, with the general consensus that increasing amounts of pollution leads to detrimental health. The World Health Organization (2018) estimates that 7 million people die each year due to breathing in polluted air, which can cause diseases such as "stroke, heart disease, lung cancer, chronic obstructive pulmonary diseases and respiratory infections".
+
+It is intuitive that worse air qualities would have more adverse effects on the human body, but air quality varies from day to day. Is the effect of the air quality in a single month significant in affecting the number of people who die that month from respiratory-related diseases? Or perhaps the accumulated past couple of months of air quality has more significance, and if so, how many months? It may even be possible, though unlikely, that air quality does not help predict the number of deaths that would occur in a month more than the number of people who died in previous months. Being able to forecast how many deaths may occur based on the air quality could help healthcare providers prepare to care for patients or issue warnings to patients and prevent their health from declining.
+
+Analyzing the Air Quality Index (AQI) and the number of deaths categorized under chronic lower respiratory diseases (CLRD) within two California counties over the span of fifteen years may give insight to these questions. Kern County has twelve times the rate of people who die of chronic respiratory diseases than that of the entirety of California (Perez 2018), making it a sensible choice to study. Los Angeles County boasts a large population and provides a good source of robust data for analysis.
+
+### Deaths per County
+The California Department of Public Health, Center for Health Statistics and Informatics, Vital Statistics Branch curates a set of datasets called "Death Profiles by County". The data in each dataset span at least four years and contains the number of deaths that occur in each California county per month based on data entered on death certificates. The data can be filtered by cause of death, including death due to CLRD. Due to the data being collected based on death certificates, cases that need to be further investigated will lead to delays in certification, but this database is still a good starting point for many research questions. This data can help spot any trends or lack thereof in the number of people who die due to various causes over the years, from as early as 1970 to 2021. 
+
+### Air Quality Index
+The United States Environmental Protection Agency (U.S. EPA) collects air quality measurements from outdoor monitors in the United States, Puerto Rico, and U.S. Virgin Islands. The data is recorded hourly, daily, and annually. The daily AQI measurements by county in the United States can be downloaded as files for each year from the EPA's Air Data website.
+
+Air quality data is often used in studies to track if areas are doing well in decreasing air pollution, or the effects of poor air quality on people's health. For example, one study of PM$_{2.5}$ and O$_3$ exposure, two chemicals that make up part of the calculation of the general Air Quality Index,in California during 2012 concluded that "[n]onlocal emissions could lead to more deaths than local emissions" (Wang *et al.*, 2019). Air quality data thus allows for a range of exploration possibilites that can directly relate to people's lives.
+
+\newpage
+
+## Data Analysis
+To perform forecasting with models, often the time series is assumed to be stationary, having a constant mean, constant variance, and no autocorrelation dependent on time. Data in the real world oftentimes contain trends and seasonality, which must be removed before models can be fit on the residuals.
+
+```{r prep csv}
+# read in all the files regarding deaths in CA counties
+deaths_raw = list.files(path="./death_files/", full.names = TRUE) %>%
+  lapply(readr::read_csv) %>% (dplyr::bind_rows) %>% 
+  dplyr::filter(Cause_Desc == "Chronic lower respiratory diseases",
+         Strata == "Total Population") %>%
+  dplyr::select(c(Year, Month, County, Count))
+
+# read in all the files regarding aqi in US counties
+aqi_raw = list.files(path="./aqi_files/", full.names = TRUE) %>%
+  lapply(readr::read_csv) %>% (dplyr::bind_rows) %>% 
+  dplyr::filter(`State Code` == "06", `county Name` %in% c("Kern", "Los Angeles")) %>%
+  dplyr::select(c(`county Name`, Date, AQI)) %>%
+  dplyr::group_by(`county Name`, year = lubridate::year(Date), month = lubridate::month(Date)) %>%
+  dplyr::summarise(med_aqi = median(AQI))
+```
+
+### Kern County Deaths
+```{r kern deaths dataset}
+# populations in kern county from 2003 to 2018, used to make percentages
+kern_pop_year = c(714272, 736296, 760726, 784511, 803281, 818327, 830137, 841365, 
+                  848651, 854392, 862727, 869837, 876548, 881094, 887316, 893618) 
+
+# filter deaths data for kern county only
+# don't include 2020 due to COVID-19 possibly influencing deaths
+# create date timestamps, calculate counts of deaths as percentages
+kern_deaths = dplyr::filter(deaths_raw, County == "Kern") %>% 
+  dplyr::filter(Year < 2020) %>%
+  dplyr::mutate(Date = lubridate::ymd(paste(Year, Month, "01")),
+                Prev_Year_Pop = rep(kern_pop_year, each = 12),
+                Per_10k = Count/Prev_Year_Pop * 10000) %>%
+  dplyr::select(c(Date, Per_10k))
+```
+
+Monthly death counts in Kern County from 2004 to 2019 are obtained from the "Death Profiles by County" dataset. The number of deaths are measured monthly by counts and are converted to percentages per populations of 10,000 by dividing the count by the estimated population of Kern County in the previous year. The population estimates are derived from the United States Census Bureau estimates, the most accurate source for population estimates in the United States.
+
+The `kern_deaths` dataset contains 192 observations of the percentage of the population who died of CLRD per 10,000 people and has no missing values. From the plot of the time series, it appears that the variance is non-constant. there is a slight downwards trend in the mean, and there may also be some seasonality in the time series.
+
+```{r kern deaths ts, fig.height=3}
+# create time series of the deaths data
+kern_deaths_ts = ts(kern_deaths$Per_10k, frequency = 12, start = c(2004, 01))
+
+# initial exploratory plot
+forecast::ggtsdisplay(kern_deaths_ts, main="Time Series Plot of CLRD Deaths in Kern County per 10k People",
+                      tag = "Figure 1")
+```
+
+The variance can be normalized by applying a log-transformation on the data. Since the time series is measured monthly, the Seasonal Extraction in ARIMA Time Series method, or SEATS, can be used to remove any trend and seasonality. A plot of the original data, seasonally adjusted data, and trend of the data is available in the Appendix (**Figure A**).
+
+```{r kern deaths seats}
+# log-transform the time series to normalize variance
+# use SEATS to de-seasonalize data
+log(kern_deaths_ts) %>% 
+  seasonal::seas(transform.function = "none") ->
+  kern_deaths_seats
+```
+
+The plot of the residuals of the decomposed data shows that the residuals have a constant mean of about 0 and a more constant variance than before. From the autocorrelation plot of the residuals, there is significant autocorrelation at lags 2, 16, and 36. The partial autocorrelation plot of the residuals show significance at lags 2, 16, and 22.
+
+```{r kern deaths seats resid, fig.height=3}
+# extract residuals of transformed de-seasonalized data
+kern_deaths_seats_resid = forecast::remainder(kern_deaths_seats)
+
+# plot the residuals
+forecast::ggtsdisplay(kern_deaths_seats_resid, main="Time Series Plot of Residuals of SEATS Decomposed Kern County Deaths Data")
+```
+
+To check if the residuals are stationary, the Augmented Dickey-Fuller is used to see if a time series has a unit root. The test assumes the model follows the form 
+\[Y_t = \mu + \beta t + \alpha Y_{t-1} + \sum_{j=1}^{p}\phi_j \Delta Y_{t-j} + \epsilon_t\]
+and tests the hypotheses
+\[H_0: \alpha = 1 \text{ with } p=0 \text{ (the series is non-stationary)} \quad \text {vs} \quad H_a: \text{the series is stationary}\]
+
+If the $p$-value is smaller than 0.05, the null hypothesis is rejected in favor of the alternate hypothesis.
+
+```{r kern deaths seats resid stationary, include=FALSE}
+# adf test for stationarity, monthly data so set lag to 12
+tseries::adf.test(kern_deaths_seats_resid, k = 12)
+```
+
+The ADF test returns a $p$-value of 0.01, thus the null hypothesis is rejected and the residuals of the transformed de-seasonalized data are stationary.
+
+```{r kern deaths sample estimators, include=FALSE}
+# how many data points
+length(kern_deaths_seats_resid)
+
+# any missing values?
+summary(kern_deaths_seats_resid)
+
+# sample mean
+mean(kern_deaths_seats_resid)
+
+# sample var
+kern_death_rho = stats::acf(kern_deaths_seats_resid, plot=FALSE, lag.max=192)$acf[2:192]
+1/192 * var(kern_deaths_seats_resid) * (1 + 2 * sum((1 - 1:191/192) * kern_death_rho))
+```
+
+The residuals have 192 observations and no missing values. The residuals have a sample mean of 
+\[\hat{\mu} = \bar{Y} = \frac{1}{T}\sum_{t=1}^{T}Y_t = \frac{1}{192}\sum_{t=1}^{192}Y_t = 0,\]
+and sample variance of 
+\[\text{Var}(\bar{Y}) = \frac{1}{T}\sigma^2 \left[1 + 2 \sum_{j=1}^{T-1} \left(1 - \frac{|j|}{T}\right) \rho(j)\right] = \frac{1}{192}(0.035) \left[1 + 2 \sum_{j=1}^{191} \left(1 - \frac{|j|}{192}\right) \rho(j)\right] = 0.000009.\] 
+
+### Los Angeles Deaths
+```{r la dataset}
+# populations in la county from 2003 to 2018, used to make percentages
+la_pop_year = c(9767145, 9793263, 9786373, 9737955, 9700359, 9735147, 9787400, 9821647,
+                9873700, 9931394, 9987189, 10033449, 10077263, 10094865, 10092365, 10061533) # pop from 2003 - 2018
+
+# filter deaths dataset for la county
+# don't include 2020 due to COVID-19 possibly influencing deaths
+# create date timestamps, calculate counts of deaths as percentages
+la_deaths = dplyr::filter(deaths_raw, County == "Los Angeles") %>% 
+  dplyr::filter(Year < 2020) %>%
+  dplyr::mutate(Date = lubridate::ymd(paste(Year, Month, "01")),
+                Prev_Year_Pop = rep(la_pop_year, each = 12),
+                Per_10k = Count/Prev_Year_Pop * 10000) %>%
+  dplyr::select(c(Date, Per_10k))
+```
+
+Monthly death counts in Los Angeles County from 2004 to 2019 are obtained from the "Death Profiles by County" dataset. The number of deaths are measured monthly by counts and are converted to percentages per populations of 10,000 by dividing the count by the estimated population of Los Angeles County in the previous year. The population estimates are derived from the United States Census Bureau estimates, the most accurate source for population estimates in the United States.
+
+The `la_deaths` dataset contains 192 observations of the percentage of the population who died of CLRD per 10,000 people and has no missing values. From the plot of the time series, it appears that like the `kern_deaths` dataset, the variance is non-constant and the time series may also have seasonality. 
+
+```{r la deaths ts, fig.height=3}
+# create time series of la deaths
+la_deaths_ts = stats::ts(la_deaths$Per_10k, frequency = 12, start = c(2004, 01))
+
+# exploratory plot of time series
+forecast::ggtsdisplay(la_deaths_ts, main="Time Series Plot of CLRD Deaths in LA County per 10k People")
+```
+
+The variance can be normalized by applying a log-transformation on the data. Since the time series is measured monthly, the SEATS method can be used to remove any trend and seasonality. A plot of the original data, seasonally adjusted data, and trend of the data is available in the Appendix (**Figure B**).
+
+```{r la deaths seats}
+# normalize variance with a log-transform then de-seasonalize with SEATS
+log(la_deaths_ts) %>% 
+  seasonal::seas(transform.function = "none") ->
+  la_deaths_seats
+```
+
+The plot of the residuals of the decomposed data shows that the data has a constant mean of about 0 and a temporary shock in December 2005, but otherwise constant variance. The autocorrelation plot of the residuals shows that there is significant correlation at lags 10 and 12. The partial autocorrelation plot of the residuals shows no significant lags at all.
+
+```{r la deaths seats resid, fig.height=3}
+# extract residuals of data
+la_deaths_seats_resid = forecast::remainder(la_deaths_seats)
+
+# plot residuals
+forecast::ggtsdisplay(la_deaths_seats_resid, main="Time Series Plot of Residuals of SEATS Decomposed LA County Deaths Data") 
+
+# where is the peak
+# (la_deaths_seats_resid == max(la_deaths_seats_resid))
+```
+
+```{r la deaths seats resid stationary, include=FALSE}
+# check stationary
+tseries::adf.test(la_deaths_seats_resid, k = 12)
+```
+
+Once again, to check if the residuals are stationary, the Augmented Dickey-Fuller is used with the same model assumptions and hypotheses as before. The $p$-value from the test is 0.01 is smaller than 0.05, thus the residuals of the transformed de-seasonalized time series are stationary.
+
+```{r la deaths sample estimators, include=FALSE}
+# how many data points
+length(la_deaths_seats_resid)
+
+# any missing values?
+summary(la_deaths_seats_resid)
+
+# sample mean
+mean(la_deaths_seats_resid)
+
+# sample var
+la_death_rho = stats::acf(la_deaths_seats_resid, plot=FALSE, lag.max=192)$acf[2:192]
+1/192 * var(la_deaths_seats_resid) * (1 + 2 * sum((1 - 1:191/192) * la_death_rho))
+```
+
+The residuals 192 observations and no missing values. The residuals have a sample mean of 
+\[\hat{\mu} = \bar{Y} = \frac{1}{T}\sum_{t=1}^{T}Y_t = \frac{1}{192}\sum_{t=1}^{192}Y_t = 0.0018,\]
+and sample variance of 
+\[\text{Var}(\bar{Y}) = \frac{1}{T}\sigma^2 \left[1 + 2 \sum_{j=1}^{T-1} \left(1 - \frac{|j|}{T}\right) \rho(j)\right] = \frac{1}{192}(0.0029) \left[1 + 2 \sum_{j=1}^{191} \left(1 - \frac{|j|}{192}\right) \rho(j)\right] = 0.000002.\] 
+
+### Kern County AQI
+```{r kern aqi dataset}
+# filter aqi data for kern county
+kern_aqi = dplyr::filter(aqi_raw, `county Name` == "Kern") %>%
+  dplyr::mutate(Date = lubridate::ymd(paste(year, month, "01"))) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(c(Date, med_aqi))
+```
+
+Median AQI in Kern County from 2004 to 2019 are obtained from the datasets created by the US EPA. The AQI are measured daily and are aggregated into monthly medians in order to have the same time periods as the county deaths data.
+
+The `kern_aqi` dataset contains 192 observations of the median air quality index in Kern County and contains no missing values. From the plot of the time series, it appears that the variance is non-constant and there is a negative linear trend.
+
+```{r kern aqi ts, fig.height=3}
+# create time series of data
+kern_aqi_ts = stats::ts(kern_aqi$med_aqi, frequency = 12, start = c(2004, 01))
+
+# plot time series
+forecast::ggtsdisplay(kern_aqi_ts, main="Time Series Plot of Kern County Median AQI") 
+```
+
+Since the data is also measured monthly, the SEATS decomposition can be used to remove trend and seasonality. However, after performing the SEATS decomposition on the Los Angeles County deaths data, the returned residuals resemble white noise. If the residuals are white noise, the data has no significant structure and thus would not be a particularly beneficial covariate to have when regressing the monthly deaths data.
+
+```{r kern aqi seats, include = FALSE}
+# seats decompose time series
+log(kern_aqi_ts) %>% 
+  seasonal::seas(transform.function = "none") ->
+  kern_aqi_seats
+
+# get residuals
+kern_aqi_seats_resid = remainder(kern_aqi_seats)
+
+tseries::adf.test(kern_aqi_seats_resid, k=12)
+# p-val = 0.01 => stationary
+
+stats::Box.test(kern_aqi_seats_resid, type = "Lj")
+# p-val = 0.84 => data is iid, aka white noise
+```
+
+The data can be transformed in other ways. A logarithm is applied to normalize the difference, and a difference at lag set to 12 is used to remove the seasonality. The plot of the transformed data shows that the data has a constant mean of about 0 and a more constant variance than before. The autocorrelation plot of the residuals shows that there is significant correlation at lags 12 and 19. The partial autocorrelation plot of the residuals shows significance at lags 12 and 24 as well.
+
+```{r kern aqi transform}
+# log transform to normalize variance, difference to remove seasonality
+kern_aqi_log_diff = log(kern_aqi_ts) %>% diff(lag = 12)
+
+# plot transformed data
+forecast::ggtsdisplay(kern_aqi_log_diff, 
+                      main="Time Series Plot of Log-Transformed Differenced Kern County Median AQI")
+```
+
+```{r kern aqi seats resid stationary, include=FALSE}
+# test for stationarity
+tseries::adf.test(kern_aqi_log_diff, k=12)
+```
+
+The Augmented Dickey-Fuller is applied to check stationarity of the residuals using the same assumptions and hypothesis as before. The test returns a $p$-value 0.01 which is less than 0.05, thus the null hypothesis is rejected and the transformed data is considered stationary.
+
+```{r kern aqi sample estimators, include=FALSE}
+# how many data points
+length(kern_aqi_log_diff)
+
+# any missing values?
+summary(kern_aqi_log_diff)
+
+# sample mean
+mean(kern_aqi_log_diff)
+
+# sample var
+kern_aqi_rho = stats::acf(kern_aqi_log_diff, plot=FALSE, lag.max=180)$acf[2:180]
+1/180 * var(kern_aqi_log_diff) * (1 + 2 * sum((1 - (1:179)/180) * kern_aqi_rho))
+```
+
+The log-transformed differenced data contains 180 observations and no missing values. The data has a sample mean of 
+\[\hat{\mu} = \bar{Y} = \frac{1}{T}\sum_{t=1}^{T}Y_t = \frac{1}{180}\sum_{t=1}^{180}Y_t = -0.03,\]
+and sample variance of 
+\[\text{Var}(\bar{Y}) = \frac{1}{T}\sigma^2 \left[1 + 2 \sum_{j=1}^{T-1} \left(1 - \frac{|j|}{T}\right) \rho(j)\right] = \frac{1}{180}(0.07) \left[1 + 2 \sum_{j=1}^{179} \left(1 - \frac{|j|}{180}\right) \rho(j)\right] = 0.00007.\] 
+
+### Los Angeles County AQI
+```{r la aqi dataset}
+# filter for la county
+la_aqi = dplyr::filter(aqi_raw, `county Name` == "Los Angeles") %>%
+  dplyr::mutate(Date = lubridate::ymd(paste(year, month, "01"))) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(c(Date, med_aqi))
+```
+
+Median AQI in Los Angeles County from 2004 to 2019 are obtained from the datasets created by the US EPA. The AQI are measured daily and are aggregated into monthly medians in order to have the same time periods as the county deaths data.
+
+The `la_aqi` dataset contains 192 observations of the median air quality index in Los Angeles County and contains no missing values. From the plot of the time series, it appears that the variance is non-constant and there is a negative linear trend. 
+
+```{r la aqi ts, fig.height=3}
+# make time series
+la_aqi_ts = stats::ts(la_aqi$med_aqi, frequency = 12, start = c(2004, 01))
+
+# plot time series
+forecast::ggtsdisplay(la_aqi_ts, main="Time Series Plot of LA County Median AQI")
+```
+
+Since the data is also measured monthly, the SEATS decomposition can be used to remove trend and seasonality. However, after performing the SEATS decomposition on the Los Angeles County deaths data, the residuals resemble white noise, just like with the Kern County AQI data. Decomposing the data in this way would not create a beneficial covariate dataset.
+
+```{r la aqi seats, include = FALSE}
+# seats decomposition
+log(la_aqi_ts) %>% 
+  seasonal::seas(transform.function = "none") ->
+  la_aqi_seats
+
+# extract residuals
+la_aqi_seats_resid = remainder(la_aqi_seats)
+
+# test stationarity
+tseries::adf.test(la_aqi_seats_resid, k=12)
+# p-val of 0.04 => stationary
+
+# test white noise
+stats::Box.test(la_aqi_seats_resid, type = "Lj")
+# p-val of 0.16 => iid, aka white noise
+```
+
+Alternate methods can be used to transform the data. The variance can be normalized by applying a log-transformation on the dataset. Since the time series is measured monthly, differencing with the lag set to 12 might remove any seasonal trend.
+
+```{r la aqi transform}
+# transform to normalize variance, difference to remove seasonal trend
+la_aqi_log_diff = log(la_aqi_ts) %>% diff(lag = 12)
+```
+
+The plot of the transformed data shows that the data has a constant mean of about 0 and a more normalized variance than before. The autocorrelation plot of the residuals shows that there is significant correlation at lag 12. The partial autocorrelation plot of the residuals shows significant correlation at lags 12 and 24.
+
+```{r la aqi resid, fig.height=3}
+# plot residuals
+forecast::ggtsdisplay(la_aqi_log_diff, 
+                      main="Time Series Plot of Log-Transformed Differenced LA County Deaths Median AQI")
+```
+
+```{r la aqi stationarity, include=FALSE}
+# test for stationarity
+tseries::adf.test(la_aqi_log_diff, k=12)
+```
+
+The Augmented Dickey-Fuller is applied to check stationarity of the residuals using the same assumptions and hypotheses as before. The returned $p$-value of 0.01 is less than 0.05, thus the null hypothesis is rejected and the transformed data is stationary.
+
+```{r la aqi sample estimators, include=FALSE}
+# how many data points
+length(la_aqi_log_diff)
+
+# any missing values?
+summary(la_aqi_log_diff)
+
+# sample mean
+mean(la_aqi_log_diff)
+
+# sample var
+la_aqi_rho = stats::acf(la_aqi_log_diff, plot=FALSE, lag.max=180)$acf[2:180]
+1/180 * var(la_aqi_log_diff) * (1 + 2 * sum((1 - (1:179)/180) * la_aqi_rho))
+```
+
+The log-transformed differenced data contains 180 observations and no missing values. The data has a sample mean of 
+\[\hat{\mu} = \bar{Y} = \frac{1}{T}\sum_{t=1}^{T}Y_t = \frac{1}{180}\sum_{t=1}^{180}Y_t = -0.02,\]
+and sample variance of 
+\[\text{Var}(\bar{Y}) = \frac{1}{T}\sigma^2 \left[1 + 2 \sum_{j=1}^{T-1} \left(1 - \frac{|j|}{T}\right) \rho(j)\right] = \frac{1}{180}(0.04) \left[1 + 2 \sum_{j=1}^{179} \left(1 - \frac{|j|}{180}\right) \rho(j)\right] = 0.00003.\] 
+
+### Relationships Between Data
+Assuming that air quality data can be used to estimate the number of deaths per month attributed to CLRD, correlations between the time series are expected. Correlation plots between the original datasets and the transformed datasets are shown below.
+
+```{r compare all data}
+# compare original data to each other
+GGally::ggpairs(as.data.frame(cbind("Kern County Deaths" = kern_deaths_ts,
+                            "Kern County AQI" = kern_aqi_ts,
+                            "LA County Deaths" = la_deaths_ts,
+                            "LA County AQI" = la_aqi_ts))) +
+  ggplot2::labs(title ="Comparison Plot of Original Time Series")
+
+# combine residuals of decomposed deaths data and transformed AQI data to each other
+GGally::ggpairs(as.data.frame(cbind("Kern County Deaths Residuals" = kern_deaths_seats_resid,
+                            "Log, Differenced Kern County AQI" = la_deaths_seats_resid,
+                            "LA County Deaths Residuals" = kern_aqi_log_diff,
+                            "Log, Differenced LA County AQI" = la_aqi_log_diff))) +
+  ggplot2::labs(title = "Compairson Plot of Residuals and Transformed Data")
+```
+
+\newpage
+
+## Models
+Time series data can be fit into many different types of models, but not all of the models are the best in predicting future data. Good models for time series data separate the response into different components and a white noise component, where the white noise is stationary and uncorrelated with constant variance. Models with lower AIC and lower BIC values perform better than models with higher AIC and higher BIC, thus the former model would be chosen in favor over the latter.
+
+### auto.arima Models on Deaths Data
+The correlation between the deaths and AQI data for each of the counties is not very high, so it is possible that the number of deaths each month depends more on just the past deaths data.
+
+The residuals of the SEATS decomposed `kern_deaths` and `la_deaths` time series are stationary, meaning they do not need to be differenced further to achieve a constant mean, so an ARMA or SARMA model may be suitable. An ARMA or SARMA model is built based on past observations of data, current and past observations of white noise, and sometimes a periodic component if the data is measured monthly, like it is here. The `auto.arima` model can fit the best ARIMA model as chosen by the computer.
+
+The `auto.arima` command selects SARMA models for both the `kern_deaths` and `la_deaths` residuals. The SARMA$(p, q) \times (P, Q)_s$ model takes on the form
+
+$$\begin{aligned} 
+\phi(B) \Phi(B)_{P,s} Y_t &= \theta(B) \Theta(B)_{Q,s} \epsilon_t \\
+\text{where} \\
+Y_t \cdot B^n &= Y_t - Y_{t-1} - Y_{t-2} - \cdots - Y_{t-n} \\
+\epsilon_t \cdot B^n &= \epsilon_t - \epsilon_{t-1} - \epsilon_{t-2} - \cdots - \epsilon_{t-n} \\
+\phi(B) &= 1 - \phi_1B - \phi_2 B^2 - \cdots - \phi_p B^p \\
+\Phi(B)_{P,s} &= 1 - \Phi_1 B^s - \Phi_2 B^{2s} - \cdots - \Phi_p B^{Ps}\\
+\theta(B) &= 1 + \theta_1 B + \theta_2 B^2 + \cdots + \theta_q B^q \\
+\Theta(B)_{Q, s} &= 1 + \Theta_1 B^s + \Theta_2 B^{2s} + \cdots + \Theta_Q B^{Qs}
+\end{aligned}$$
+
+where $s$ is the length of the periodic component in the time series, $Y_t$ is the observed number of deaths in month $t$, and $\epsilon_t$ is white noise observed in month $t$. 
+
+```{r kern autoarima, include=FALSE}
+# use auto.arima to find the best model
+kern_deaths_autoarima = forecast::auto.arima(kern_deaths_seats_resid)
+
+# get coefficients of model, AIC, BIC
+base::summary(kern_deaths_autoarima)
+```
+
+The chosen model for the residuals of the `kern_deaths` data is a SARMA$(1, 3) \times (0, 2)_{12}$ model:
+
+\[(1 - 0.7214 B) Y_t = (1 -0.8815B + 0.3550B^2 -0.3391 B^3) (1 -0.3923 B^{12} -0.3906B^{24}) \epsilon_t\]
+
+with an AIC of -113.8 and a BIC of -91. The residuals from this model are shown below.
+
+```{r kern deaths autoarima residuals}
+kern_deaths_autoarima %>% stats::residuals() %>% 
+  forecast::ggtsdisplay(main = "Residuals of Selected SARMA Model for Kern County Deaths")
+```
+
+```{r kern death autoarima WN resid test, include=FALSE}
+# test residuals for white noise structure
+kern_deaths_autoarima %>% stats::residuals() %>% stats::Box.test(type="Lj")
+```
+
+
+To see if the $\epsilon_t$ component resembles white noise, the Ljung-Box test can be performed on the residuals of the model. The Ljung-Box test tests the hypotheses
+\[H_0 : \text{the data is i.i.d}\quad \text{vs} \quad H_a: \text{the data is not i.i.d}\]
+by calculating
+\[Q = T\sum_{j=1}^k \hat{\rho}^2_Y (j)\]
+
+which can be approximated by a $\chi^2_k$ distribution under the null hypothesis. If the $p$-value returned by the test is greater than 0.05, the null hypothesis is not rejected and the data appears to be independent identically distributed observations, which would indicate the data is also white noise. Otherwise, the data would not be white noise.
+
+The test returns a $p$-value of 0.9348 which is greater than 0.05, thus the residuals of the fitted SARMA model are white noise.
+
+```{r la autoarima, include = FALSE}
+# use auto.arima to find the best model
+la_deaths_autoarima = forecast::auto.arima(la_deaths_seats_resid)
+
+# get coefficients, AIC, BIC
+base::summary(la_deaths_autoarima)
+```
+
+The chosen model for the residuals of the `la_deaths` data is a SARMA$(0, 1) \times (0, 1)_{12}$ model:
+
+\[Y_t = (1 - 0.1176 B) (1 - 0.1946 B^{12}) \epsilon_t \]
+
+with an AIC of -579.69 and a BIC of -570.05. The residuals from this model are shown below.
+
+```{r la deaths autoarima residuals}
+la_deaths_autoarima %>% stats::residuals() %>% 
+  forecast::ggtsdisplay(main = "Residuals of Selected SARMA Model for LA County Deaths")
+```
+
+```{r la death autoarima WN resid test, include=FALSE}
+# test residuals for white noise structure
+la_deaths_autoarima %>% stats::residuals() %>% stats::Box.test(type="Lj")
+```
+
+To see if the $\epsilon_t$ component resembles white noise, the Ljung-Box test can be performed on the residuals of the model with the same test statistic and hypotheses as earlier. The test returns a $p$-value of 0.97 which is greater than 0.05, thus the residuals of the fitted SARMA model are white noise.
+
+### Manual ARMA Models on Deaths Data
+Although the computer supposedly selected the best ARIMA model, perhaps other models may do better. Looking at the ACF and PACF plots of the residuals of the `kern_deaths` data, there is a significant lag at time 2 for both. This may correspond to an ARMA(2, 2) model:
+
+\[Y_t - \mu_Y = \phi_1 (Y_{t-1} - \mu_Y) + \phi_2 (Y_{t-2} - \mu_Y) + \epsilon_t + \theta_1 \epsilon_{t-1} + \theta_2 \epsilon_{t-2}.\]
+
+```{r kern arma, include = FALSE}
+# fit manually selected model
+kern_deaths_arma = stats::arima(kern_deaths_seats_resid, c(2, 0, 2))
+
+# get AIC, BIC
+broom::glance(kern_deaths_arma)[c("AIC", "BIC")]
+
+# get coefficients
+summary(kern_deaths_arma)
+```
+
+The manually selected model has the parameters
+
+\[Y_t = -0.7018 (Y_{t-1}) -0.5793 (Y_{t-2}) + \epsilon_t + 0.6388 \epsilon_{t-1} + 0.7383 \epsilon_{t-2}\]
+
+with an AIC of -99.4 and a BIC of -79.85. The residuals from this model are shown below.
+
+```{r kern deaths arma residuals}
+kern_deaths_arma %>% stats::residuals() %>% 
+  forecast::ggtsdisplay(main = "Residuals of Selected ARMA Model for Kern County Deaths")
+```
+
+
+```{r kern arma wn resid test, include = FALSE}
+kern_deaths_arma %>% stats::residuals() %>% stats::Box.test(type="Lj")
+```
+
+To see if the $\epsilon_t$ component resembles white noise, the Ljung-Box test can be performed on the residuals of the model with the same test statistic and hypotheses as earlier. The test returns a $p$-value of 0.7651 which is greater than 0.05, thus the residuals of the fitted ARMA model are white noise.
+
+Looking at the ACF and PACF plots of the residuals of the `la_deaths` data, there is a significant lag at time 10 in the ACF and no significant lag in the PACF. This may correspond to an ARMA(0, 10) model:
+
+\[Y_t - \mu_Y = \epsilon_t + \theta_1 \epsilon_{t-1} + \theta_2 \epsilon_{t-2} + \cdots + \theta_{10} \epsilon_{t-10}\]
+
+```{r la arma, include = FALSE}
+# fit manually selected model
+la_deaths_arma = stats::arima(la_deaths_seats_resid, c(0, 0, 10))
+
+# get AIC, BIC
+broom::glance(la_deaths_arma)[c("AIC", "BIC")]
+
+# get coefficients
+base::summary(la_deaths_arma)
+```
+
+The manually selected model has the parameters:
+
+$$\begin{aligned}
+Y_t - 0.002 &= \epsilon_t -0.0592 \epsilon_{t-1} -0.0775 \epsilon_{t-2} - 0.0324 \epsilon_{t-3} + 0.0823 \epsilon_{t-4} + 0.0091 \epsilon_{t-5} \\
+&\quad - 0.0702 \epsilon_{t-6} + 0.0755 \epsilon_{t-7} - 0.0929 \epsilon_{t-8} + 0.1088 \epsilon_{t-9} - 0.1947 \epsilon_{t-10}
+\end{aligned}$$
+
+with an AIC of -569.96 and a BIC of -530.87. The residuals from this model are shown below.
+
+```{r la deaths arma residuals}
+# plot residuals of the model
+la_deaths_arma %>% stats::residuals() %>% 
+  forecast::ggtsdisplay(main = "Residuals of Selected ARMA Model for LA County Deaths")
+```
+
+```{r la arma wn resid test, include=FALSE}
+# test residuals for white noise structure
+la_deaths_arma %>% stats::residuals() %>% stats::Box.test(type = "Lj")
+```
+
+To see if the $\epsilon_t$ component is white noise, the Ljung-Box test can be performed on the residuals of the model with the same test statistic and hypotheses as earlier. The test returns a $p$-value of 0.8357 which is greater than 0.05, thus the residuals of the fitted ARMA model are white noise. 
+
+The manually selected ARMA models do not have lower AIC and BIC than the SARMA models for both datasets, so the ARMA models do not perform better than the SARMA model in terms of AIC and BIC. This may indicate that the residuals of the data after removing seasonality and trend still contain a seasonal component. The SARMA models will be used to make forecasts without covariate data.
+
+### Regression Model
+Assuming that AQI would have an effect on the number of chronic lower respiratory disease-related deaths, a regression model can be fit with both sets of data. The regression model assumes the form 
+$$Y_t = \alpha + \beta_0 X_t + \beta_1 X_{t-1} + \cdots + \beta_q X_{t-q} + \epsilon_t$$
+where $Y_t$ and $X_t$ are stationary random variables and $\epsilon_t$ is white noise. $Y_t$ would be the residuals of the number of deaths per month and $X_t$ would be AQI in month $t$ with transformation performed to achieve stationarity.
+
+```{r kern regression lagged, include = FALSE}
+# initialize data frame to store data
+kern_ardl_stats_per_k = c()
+
+# loop through multiple lags to find the best one
+for (k in (0:36)){
+  model = dynlm::dynlm(kern_deaths_seats_resid ~ L(kern_aqi_log_diff, 0:k))
+  
+  kern_ardl_stats_per_k = rbind(kern_ardl_stats_per_k, 
+                                cbind("lag" = k,
+                                      broom::glance(model)[c("AIC","BIC")],
+                                      "White Noise Reisudals?" = stats::Box.test(residuals(model), type = "Lj")$p.value > 0.05))
+}
+kern_ardl_stats_per_k
+```
+
+Multiple regression models are fit on the Kern County data, regressing the residuals of the number of deaths in a month with the residuals of the AQI in that month, the residuals of the AQI in that month and the previous month, and so on. The values of AIC and BIC are calculated for each of the models at the different values of lag (Appendix **Table 1**). The model with the lowest AIC and BIC is the ARDL(0,0) model with an AIC of -90.56477 and BIC of -80.985903:
+
+```{r kern regression lag model, include = FALSE}
+# calculate selected model
+kern_regression_model = dynlm::dynlm(kern_deaths_seats_resid ~ L(kern_aqi_log_diff, 0:0))
+
+# get coefficients
+summary(kern_regression_model)
+```
+
+\[Y_t = -0.001205 -0.077873 X_t + \epsilon_t.\]
+
+The residuals from this model are shown below.
+
+```{r kern regression residuals}
+kern_regression_model %>% residuals() %>% 
+  forecast::ggtsdisplay(main = "Residuals of Selected Regression Model for Kern County Deaths")
+```
+
+```{r kern regression wn resid test, include = FALSE}
+# test residuals for white noise structure
+kern_regression_model %>% stats::residuals() %>% stats::Box.test(type="Lj")
+```
+
+To see if the $\epsilon_t$ component resembles white noise, the Ljung-Box test can be performed on the residuals of the model with the same test statistic and hypotheses as earlier. The test returns a $p$-value of 0.1654 which is greater than 0.05, thus the residuals resemble white noise.
+
+```{r la regression lagged, include = FALSE}
+# initialize data frame to store results
+la_ardl_stats_per_k = c()
+
+# loop over different values of lag to find the best one
+for (k in (0:36)){
+  model = dynlm::dynlm(la_deaths_seats_resid ~ L(la_aqi_log_diff, 0:k))
+  
+  la_ardl_stats_per_k = rbind(la_ardl_stats_per_k, 
+                              cbind("lag" = k, 
+                                    broom::glance(model)[c("AIC","BIC")],
+                                    "White Noise Reisudals?" = stats::Box.test(residuals(model), type = "Lj")$p.value > 0.05))
+}
+
+la_ardl_stats_per_k
+```
+Multiple regression models are fit on the Los Angeles County data with the same procedure as on the Kern County data. The values of AIC and BIC are calculated for each of the models at the different values of lag (Appendix **Table 2**). The model with the lowest AIC is the ARDL(0, 12) model with an AIC of -538.2696	and a BIC of -491.4101, while the model with the lowest BIC is the ARDL(0, 0) model with an AIC of -532.6165	and a BIC of -523.0376. However, both of the residuals of the models fail the Ljung-Box test, indicating that the residuals do not resemble white noise and the model is not a good fit for the data. 
+
+The regression model that does not fail the Ljung-Box test and has the lowest AIC and BIC is the ARDL(0, 1) model with an AIC of -529.3588 and a BIC of -516.6093:
+
+```{r la regression lag model, include = FALSE}
+# calculate the selected model
+la_regression_model = dynlm::dynlm(la_deaths_seats_resid ~ L(la_aqi_log_diff, 0:1))
+
+# get coefficients
+base::summary(la_regression_model)
+```
+
+\[Y_t = 0.003419 - 0.019076 X_t + 0.016148 X_{t-2} + \epsilon_t\]
+
+The residuals from this model are shown below.
+
+```{r la regression residuals}
+# plot residuals of the model
+la_regression_model %>% stats::residuals() %>% 
+  forecast::ggtsdisplay(main = "Residuals of Selected Regression Model for LA County Deaths")
+```
+
+```{r la regression wn resid test, include=FALSE}
+# test residuals for white noise structure
+la_regression_model %>% stats::residuals() %>% stats::Box.test(type = "Lj")
+```
+
+To see if the $\epsilon_t$ component resembles white noise, the Ljung-Box test can be performed on the residuals of the model with the same test statistic and hypotheses as earlier. The test returns a $p$-value of 0.06, which is slightly larger than 0.05, so the null hypothesis is not rejected and the residuals resemble white noise. 
+
+### AQI Models
+In order to perform forecasts using the models for the deaths per month regressed with the AQI data, forecasts must be made on the values of the AQI data as well. Forecasting the AQI is not the main objective of this study, so a reasonably accurate model will do. From earlier, the `auto.arima` does a good job of fitting a model with low AIC and BIC, so it can be used here again to fit models for the AQI data.
+
+The `auto.arima` model on the residuals of the log-transformed differenced Kern County AQI data returns a SARMA$(0,0,1)\times(1,0,2)_{12}$ model with an AIC of -19.41 and BIC of -3.45:
+
+\[(1 + 0.3766 B^{12}) Y_t = (1 + 0.1831 B) (1 - 0.3766 B^{12} - 0.3703 B^{24}) \epsilon_t\]
+
+```{r kern aqi model auto arima, include = FALSE}
+# find the model
+kern_aqi_autoarima = forecast::auto.arima(kern_aqi_log_diff)
+
+# get coefficients
+base::summary(kern_aqi_autoarima)
+```
+
+The residuals of this model is shown below.
+
+```{r kern aqi model residuals}
+# plot the residuals of the model
+kern_aqi_autoarima %>% stats::residuals() %>% 
+  forecast::ggtsdisplay(main = "Residuals of Selected MA(1) Model for Kern County Median AQI")
+```
+
+```{r kern aqi model WN resid test, include=FALSE}
+# test residuals for white noise structure
+kern_aqi_autoarima %>% stats::residuals() %>% stats::Box.test(type = "Lj")
+```
+
+To see if the $\epsilon_t$ component resembles white noise, the Ljung-Box test can be performed on the residuals of the model with the same test statistic and hypotheses as earlier. The test returns a $p$-value of 0.6288, so the null hypothesis is not rejected and the residuals of the model are white noise.
+
+```{r la aqi model auto arima, include=FALSE}
+# find the model
+la_aqi_autoarima = forecast::auto.arima(la_aqi_log_diff)
+
+# get coefficients
+base::summary(la_aqi_autoarima)
+```
+
+The `auto.arima` model on the transformed and differenced Los Angeles County AQI data returns a SARMA$(4,0,1) \times (2,0,1)_{12}$ model with an AIC of -124.36 and BIC of -95.62:
+
+\[(1 - 0.3925 B + 0.0321 B^2 - 0.0327 B^3 - 0.0567 B^4)(1 - 0.1213B^{12}+0.0591 B^{24}) Y_t = (1 - 0.2989 B)(1 - 0.8090 B^{12}) \epsilon_t\]
+
+The residuals of this model is shown below.
+
+```{r la aqi model residuals}
+# plot the residuals of the model
+la_aqi_autoarima %>% stats::residuals() %>% 
+  forecast::ggtsdisplay(main = "Residuals of Selected SARIMA Model for LA County Median AQI")
+```
+
+```{r la aqi model WN resid, include=FALSE}
+# test residuals for white noise structure
+la_aqi_autoarima %>% stats::residuals() %>% stats::Box.test(type = "Lj")
+```
+
+To see if the $\epsilon_t$ component resembles white noise, the Ljung-Box test can be performed on the residuals of the model with the same test statistic and hypotheses as earlier. The test returns a $p$-value of 0.6379, greater than 0.05, indicating that the residuals of this model is white noise.
+
+\newpage
+
+## Forecasting
+### Forecasting Without Exogenous Variables
+The `auto.arima` selected models perform the best in predicting the residuals of the transformed deaths per month data without exogenous variables. Using these models, forecasts for future months can be calculated under the model
+
+\[\hat{Y}_t = \exp\left\{\hat{T}_t + \hat{S}_t + \hat{R}_t\right\}\]
+
+where $\hat{Y}_t$ is the predicted number of deaths at time $t$ per 10,000 people, $\hat{T}_t$ is the predicted value of the trend component at time $t$, $\hat{S}_t$ is the predicted value of the seasonal component at time $t$, and $\hat{R}_t$ is the predicted value of the residuals at time $t$, estimated using the models selected.
+
+The trend and seasonal component for the data can be estimated trivially using the past values of the trend component and seasonal component extracted with the SEATS method. Using the SARMA$(1, 3) \times (0, 2)_{12}$ model to predict the residuals for Kern County, the final forecasts for the next two years with 95% confidence intervals looks as follows.
+
+```{r kern autoarima forecast}
+# forecast residuals for Kern deaths data using model
+kern_deaths_autoarima_r = forecast::forecast(kern_deaths_autoarima, h = 24)
+
+# calculate deaths per 10k value by adding trend and seasonal component
+kern_deaths_autoarima_y = base::exp(forecast::naive(forecast::trendcycle(kern_deaths_seats), h=24)$mean + 
+                                     forecast::snaive(forecast::seasonal(kern_deaths_seats), h=24)$mean + 
+                                    kern_deaths_autoarima_r$mean)
+
+# calculate upper 95% confidence interval bound
+kern_deaths_autoarima_y_upper95 = base::exp(forecast::naive(forecast::trendcycle(kern_deaths_seats), h=24)$mean + 
+                                     forecast::snaive(forecast::seasonal(kern_deaths_seats), h=24)$mean + 
+                                    kern_deaths_autoarima_r$upper[,2])
+
+# calculate lower 95% confidence interval bound
+kern_deaths_autoarima_y_lower95 = base::exp(forecast::naive(forecast::trendcycle(kern_deaths_seats), h=24)$mean + 
+                                     forecast::snaive(forecast::seasonal(kern_deaths_seats), h=24)$mean + 
+                                    kern_deaths_autoarima_r$lower[,2])
+
+# combine observed data and forecasted data in order to plot
+kern_deaths_autoarima_data = data.frame(Type = c(rep("Observed", 192), rep("Forecasted", 24)),
+                                        date = time(ts(c(kern_deaths_ts, kern_deaths_autoarima_y), frequency=12, start=c(2004, 01))),
+           mean = ts(c(kern_deaths_ts, kern_deaths_autoarima_y), frequency=12, start=c(2004, 01)),
+           lower_95 = c(rep(NA, 192), kern_deaths_autoarima_y_lower95),
+           upper_95 = c(rep(NA, 192), kern_deaths_autoarima_y_upper95))
+
+# plot the data
+ggplot2::ggplot(kern_deaths_autoarima_data, aes(x = date, y = mean, label=Type)) +
+  geom_line(aes(color = Type)) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95, fill = Type), alpha = 0.3) +
+  ggplot2::labs(title = "Deaths per 10k per Month in Kern County",
+       y = "Percentage") +
+  scale_color_manual(values = c("gray", "red"), breaks = c("Observed", "Forecasted")) + 
+  scale_fill_manual(values = c("gray", "red"), breaks = c("Observed", "Forecasted"))
+```
+
+The trend and seasonal component for the data can be estimated trivially once again for the Los Angeles data. Using the SARMA$(0, 1) \times (0, 1)_{12}$ model to predict the residuals for Los Angeles County, the final forecasts for the next two years with 95% confidence intervals looks as follows.
+
+```{r la autoarima forecast}
+# forecast residuals for LA deaths data using model
+la_deaths_autoarima_r = forecast(la_deaths_autoarima, h = 24)
+
+# calculate deaths per 10k value by adding trend and seasonal component to residuals
+la_deaths_autoarima_y = base::exp(forecast::naive(forecast::trendcycle(la_deaths_seats), h=24)$mean + 
+                                    forecast::snaive(forecast::seasonal(la_deaths_seats), h=24)$mean + 
+                                    la_deaths_autoarima_r$mean)
+
+# calculate upper 95% confidence interval bound
+la_deaths_autoarima_y_upper95 = base::exp(forecast::naive(forecast::trendcycle(la_deaths_seats), h=24)$mean + 
+                                     forecast::snaive(forecast::seasonal(la_deaths_seats), h=24)$mean + 
+                                    la_deaths_autoarima_r$upper[,2])
+
+# calculate lower 95% confidence interval bound
+la_deaths_autoarima_y_lower95 = base::exp(forecast::naive(forecast::trendcycle(la_deaths_seats), h=24)$mean + 
+                                     forecast::snaive(forecast::seasonal(la_deaths_seats), h=24)$mean + 
+                                    la_deaths_autoarima_r$lower[,2])
+
+# combine observed data and forecasted data in order to plot
+la_deaths_autoarima_data = data.frame(Type = c(rep("Observed", 192), rep("Forecasted", 24)),
+                                        date = time(ts(c(la_deaths_ts, la_deaths_autoarima_y), frequency=12, start=c(2004, 01))),
+           mean = ts(c(la_deaths_ts, la_deaths_autoarima_y), frequency=12, start=c(2004, 01)),
+           lower_95 = c(rep(NA, 192), la_deaths_autoarima_y_lower95),
+           upper_95 = c(rep(NA, 192), la_deaths_autoarima_y_upper95))
+
+# plot the data
+ggplot2::ggplot(la_deaths_autoarima_data, aes(x = date, y = mean, label=Type)) +
+  geom_line(aes(color = Type)) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95, fill = Type), alpha = 0.3) +
+  ggplot2::labs(title = "Deaths per 10k per Month in Los Angeles County",
+       y = "Percentage") +
+  scale_color_manual(values = c("gray", "red"), breaks = c("Observed", "Forecasted")) + 
+  scale_fill_manual(values = c("gray", "red"), breaks = c("Observed", "Forecasted"))
+```
+
+\newpage
+
+### Forecasting with Exogenous Variables
+Using the best regression models above, forecasts for the number of deaths per month can be found under the model
+
+\[\hat{Y}_t = \exp\left\{\hat{T}_t + \hat{S}_t + f({r}_t)\right\}\]
+
+where $\hat{Y}_t$ is the predicted number of deaths at time $t$ per 10,000 people, $\hat{T}_t$ is the predicted value of the trend component at time $t$, $\hat{S}_t$ is the predicted value of the seasonal component at time $t$, and $f({r}_t)$ is the predicted value of the residuals at time $t$, a function of the log-transformed differenced AQI data.
+
+Just as before, the trend and seasonal component for the data can be estimated trivially. Using the ARDL$(0, 0)$ model to predict the residuals for Kern County, the final forecasts for the next two years with 95% confidence intervals looks as follows.
+
+```{r kern regression forecast}
+# forecast aqi data to use in model
+kern_aqi_newdata = forecast::forecast(kern_aqi_autoarima, h = 24)
+
+# initialize vectors to store data
+kern_deaths_regression_r = c()
+kern_deaths_regression_r_upper95 = c()
+kern_deaths_regression_r_lower95 = c()
+# manually calculate residuals using coefficients of model and forecasted aqi data
+for (month in (1:24)){
+  kern_deaths_regression_r = append(kern_deaths_regression_r, 
+                                    coef(kern_regression_model) %*% c(1, kern_aqi_newdata$mean[month]))
+  
+  kern_deaths_regression_r_upper95 = append(kern_deaths_regression_r_upper95,
+                                            coef(kern_regression_model) %*% c(1, kern_aqi_newdata$upper[month,2]))
+  
+  kern_deaths_regression_r_lower95 = append(kern_deaths_regression_r_lower95,
+                                            coef(kern_regression_model) %*% c(1, kern_aqi_newdata$lower[month,2]))
+}
+
+# calculate value of deaths per 10k by adding trend and seasonal component
+kern_deaths_regression_y = base::exp(forecast::naive(forecast::trendcycle(kern_deaths_seats), h=24)$mean + 
+                                     forecast::snaive(forecast::seasonal(kern_deaths_seats), h=24)$mean + 
+                                     kern_deaths_regression_r)
+
+# calculate upper 95% confidence interval bound
+kern_deaths_regression_y_upper95 = base::exp(forecast::naive(forecast::trendcycle(kern_deaths_seats), h=24)$mean + 
+                                            forecast::snaive(forecast::seasonal(kern_deaths_seats), h=24)$mean + 
+                                            kern_deaths_regression_r_upper95)
+
+# calculate lower 95% confidence interval bound
+kern_deaths_regression_y_lower95 = base::exp(forecast::naive(forecast::trendcycle(kern_deaths_seats), h=24)$mean + 
+                                            forecast::snaive(forecast::seasonal(kern_deaths_seats), h=24)$mean + 
+                                            kern_deaths_regression_r_lower95)
+
+# combine observed data and forecasted data in order to plot
+kern_deaths_regression_data = data.frame(Type = c(rep("Observed", 192), rep("Forecasted", 24)),
+                                        date = time(ts(c(kern_deaths_ts, kern_deaths_regression_y), frequency=12, start=c(2004, 01))),
+           mean = ts(c(kern_deaths_ts, kern_deaths_regression_y), frequency=12, start=c(2004, 01)),
+           lower_95 = c(rep(NA, 192), kern_deaths_regression_y_lower95),
+           upper_95 = c(rep(NA, 192), kern_deaths_regression_y_upper95))
+
+# kern_deaths_autoarima_data$lower_95 > kern_deaths_autoarima_data$upper_95 
+# the "lower" bound is greater than the "upper" bound for all valid data
+# due to signs; the "lower" bound is now the upper bound
+
+# plot the data
+ggplot2::ggplot(kern_deaths_regression_data, aes(x = date, y = mean, label=Type)) +
+  geom_line(aes(color = Type)) +
+  geom_ribbon(aes(ymax = lower_95, ymin = upper_95, fill = Type), alpha = 0.3) +
+  ggplot2::labs(title = "Deaths per 10k per Month in Kern County",
+       y = "Percentage") +
+  scale_color_manual(values = c("gray", "red"), breaks = c("Observed", "Forecasted")) + 
+  scale_fill_manual(values = c("gray", "red"), breaks = c("Observed", "Forecasted"))
+```
+
+The trend and seasonal component for the data can be estimated trivially again for the Los Angeles data. Using the ARDL$(0, 1)$ model to predict the residuals for Los Angeles County, the final forecasts for the next two years with 95% confidence intervals, though extremely tiny, looks as follows.
+
+```{r la regression forecast}
+# forecast aqi data to use in model
+la_aqi_newdata = forecast::forecast(la_aqi_autoarima, h = 24)
+
+# since there is a X_(t-1) term, the Dec 2019 aqi data is required to forecast at Jan 2020
+# combine given Dec 2019 aqi data with forecasted values of aqi for next two years
+la_aqi_newdata = data.frame(mean = c(la_aqi_log_diff[180], la_aqi_newdata$mean),
+                       lower95 = c(0, la_aqi_newdata$lower[,2]),  # since data is known, lower bound for CI at Dec 2019 is 0 
+                       upper95 = c(0, la_aqi_newdata$upper[,2]))  # same as above
+
+# initialize vector to save values
+la_deaths_regression_r = c()
+la_deaths_regression_r_upper95 = c()
+la_deaths_regression_r_lower95 = c()
+# manually calculate residuals using coefficients of model and forecasted aqi data
+for (month in (2:25)){
+  la_deaths_regression_r = append(la_deaths_regression_r, 
+                                    coef(la_regression_model) %*% c(1, la_aqi_newdata$mean[month],
+                                                                    la_aqi_newdata$mean[month - 1]))
+  
+  la_deaths_regression_r_upper95 = append(la_deaths_regression_r_upper95,
+                                            coef(la_regression_model) %*% c(1, la_aqi_newdata$upper95[month],
+                                                                    la_aqi_newdata$upper95[month - 1]))
+  
+  la_deaths_regression_r_lower95 = append(la_deaths_regression_r_lower95,
+                                            coef(la_regression_model) %*% c(1, la_aqi_newdata$lower95[month],
+                                                                    la_aqi_newdata$lower95[month - 1]))
+}
+
+# calculate value of deaths per 10k by adding trend and seasonal component
+la_deaths_regression_y = base::exp(forecast::naive(forecast::trendcycle(la_deaths_seats), h=24)$mean + 
+                                     forecast::snaive(forecast::seasonal(la_deaths_seats), h=24)$mean + 
+                                     la_deaths_regression_r)
+
+# calculate upper 95% confidence interval bound
+la_deaths_regression_y_upper95 = base::exp(forecast::naive(forecast::trendcycle(la_deaths_seats), h=24)$mean + 
+                                            forecast::snaive(forecast::seasonal(la_deaths_seats), h=24)$mean + 
+                                            la_deaths_regression_r_upper95)
+
+# calculate lower 95% confidence interval bound
+la_deaths_regression_y_lower95 = base::exp(forecast::naive(forecast::trendcycle(la_deaths_seats), h=24)$mean + 
+                                            forecast::snaive(forecast::seasonal(la_deaths_seats), h=24)$mean + 
+                                            la_deaths_regression_r_lower95)
+
+# combine observed data and forecasted data in order to plot
+la_deaths_regression_data = data.frame(Type = c(rep("Observed", 192), rep("Forecasted", 24)),
+                                        date = time(ts(c(la_deaths_ts, la_deaths_regression_y), frequency=12, start=c(2004, 01))),
+           mean = ts(c(la_deaths_ts, la_deaths_regression_y), frequency=12, start=c(2004, 01)),
+           lower_95 = c(rep(NA, 192), la_deaths_regression_y_lower95),
+           upper_95 = c(rep(NA, 192), la_deaths_regression_y_upper95))
+
+# la_deaths_regression_data$lower_95 > la_deaths_regression_data$upper_95
+# the "lower" bound is greater than the "upper" bound for all valid data
+# due to signs, the "lower" bound is now the upper bound
+
+# plot the data
+ggplot2::ggplot(la_deaths_regression_data, aes(x = date, y = mean, label=Type)) +
+  geom_line(aes(color = Type)) +
+  geom_ribbon(aes(ymax = lower_95, ymin = upper_95, fill = Type), alpha = 0.3) +
+  ggplot2::labs(title = "Deaths per 10k per Month in Los Angeles County",
+       y = "Percentage") +
+  scale_color_manual(values = c("gray", "red"), breaks = c("Observed", "Forecasted")) + 
+  scale_fill_manual(values = c("gray", "red"), breaks = c("Observed", "Forecasted"))
+```
+
+\newpage
+
+## Discussion
+Both forecasting without AQI as an exogenous variable and forecasting with AQI as an exogenous variable create predictions that look uniformly periodic. There is no variation in the peaks as seen in the observed past data, most likely due to naive estimations of the trend component and seasonality. The 95% confidence intervals on the Kern County data are larger than the 95% confidence intervals on the Los Angeles County data, indicating that the models are more confident in estimating the percentage of people who die of chronic lower respiratory disease per 10,000 people in Los Angeles County than the models that estimate the same statistic in Kern County. 
+
+Both models for the Kern County data on average forecast a maximum of around 4,900 deaths per 10,000 people in the December to January and a minimum of around 3,000 deaths per 10,000 people in August to September. Both models for the Los Angeles County data on average forecast a maximum of 3,200 deaths per 10,000 people in the winter and a minimum of 2,000 deaths per 10,000 people in September (Appendix **Table 4**). 
+
+The estimation of trend and seasonality for each county is the same for the forecasts performed with regression and the forecasts performed without regression as they are calculated with the same methods on the same data, so looking at the residuals of the model is enough to make comparisons. The values of the calculated residuals can be found in the Appendix (**Table 5**).
+
+```{r forecast comparison kern, fig.height=4}
+# plot of residuals of forecasts from regression and non-regression models in Kern County data
+forecast::autoplot(stats::window(kern_deaths_seats_resid, start=c(2016,01)), color = "gray") + 
+  forecast::autolayer(kern_deaths_autoarima_r$mean, series = "No AQI Data Forecast") +
+  forecast::autolayer(stats::ts(kern_deaths_regression_r, frequency=12,start=c(2020,01)),
+            series = "With AQI Data Forecast") +
+  ggplot2::guides(colour=guide_legend(title="Legend")) +
+  ggplot2::labs(title = "Residuals of Deaths per 10k per Month in Kern County",
+       y = "Percentage")
+```
+
+From the above plot of the residuals of both models on the Kern County data, the forecasted residuals for the two models do not have as much variation in range as the observed past residuals. The residuals made by including the AQI data as an exogenous variable are much flatter than the residuals made without exogenous variables. Based on the past residuals, where there exists many peaks and valleys, such a trend does not seem like a very good fit. Visually it appears that the forecasts made without AQI as an exogenous variable may be more reasonable to use.
+
+```{r forecast comparison la, fig.height=4}
+# plot of residuals of forecasts from regression and non-regression models in LA County data
+forecast::autoplot(stats::window(la_deaths_seats_resid, start=c(2016,01)), color = "gray") + 
+  forecast::autolayer(la_deaths_autoarima_r$mean, series = "No AQI Data Forecast") +
+  forecast::autolayer(stats::ts(la_deaths_regression_r, frequency=12,start=c(2020,01)),
+            series = "With AQI Data Forecast") +
+  ggplot2::guides(colour=guide_legend(title="Legend")) +
+  ggplot2::labs(title = "Residuals of Deaths per 10k per Month in Los Angeles County",
+       y = "Percentage")
+```
+
+Similarly for the Los Angeles County data, the forecasted residuals for both models do not have as much variation in range as the observed past residuals. The residuals made by including the AQI data as an exogenous variable are again much flatter than the residuals made without exogenous variables, although the residuals of the forecasts made without AQI data are not as varied in the Los Angeles Data compared to the Kern County data. However, by the second year the model without AQI data included starts to predict zeros for every value, while the model that includes AQI data still has slight variations in the residuals. Thus, though visually the former model forecasts residuals closer to the observations of residuals in the past in terms of behavior, this only holds true for a short forecast window. The latter model may be better for longer term forecasts.
+
+The regression models chosen to forecast the amount of people who die of chronic lower respiratory disease per 10,000 people use lags of 0 and 1. This means only the AQI of the current month and possibly the current and past month are most significant in determining the number of people who die that month of respiratory disease. The present air quality is more likely impacts a person's health immediately to the point of possible death, rather than the effects of constant exposure to air pollutants building up over a longer stretch of time leading to death. 
+
+However, the forecasts made with the two types of models for each county create very similar forecasts. In the Kern County data, the forecasted values for each month have an average absolute difference of 0.02, while for the Los Angeles data this difference is 0.001. This might mean that air quality data is not a significant variable when analyzing deaths due to chronic lower respiratory disease. Given the multiple scientific studies performed by others on the effects of air quality on health, such a conclusion does not seem very likely. 
+
+Perhaps the lack of drastic difference in these two methods can be attributed to the transformations performed on the data. The SEATS decomposition was used on the county deaths data while simple differencing was performed on the AQI data; this possibly makes a difference when using AQI as a variable in the model. Or, perhaps the `auto.arima` selected model for the AQI data does not capture all the structure present in the data and thus makes less accurate forecasts of the AQI, which in turn leads to less accurate forecasts of the deaths per 10,000 people. The models with the lowest AIC and BIC may also be the best models when modeling the past data, but not the best data when forecasting future data. Additionally, all of the tests for stationarity and resemblance for white noise used the same two tests, the ADF test and the Ljung-Box test. There are other tests that test for the same things, such as the Box-Pierce test for independence. Using those tests may lead to different conclusions regarding the suitability of the dataset, what transformations to perform, or what models to fit than the one reached here.
+
+## Conclusion
+Based on the study performed, the air quality in recent months are more significant in affecting the number of people who die in that month due to CLRD than a prolonged exposure. In Kern County, only the current month is significant while in Los Angeles County, both the current month and past month are significant. However, the models do not appear to be particularly good at forecasting future values of deaths in the short term when compared to forecasts made without including AQI as an explanatory variable. Alternate transformations or model selection criteria may need to be performed to see if this holds true in all cases.
+
+\newpage
+
+## Appendix
+```{r appendix 1, fig.height=5}
+# plot of the transformed de-seasonalized Kern deaths data
+forecast::autoplot(log(kern_deaths_ts), series = "Log-Transformed Data") +
+  forecast::autolayer(forecast::trendcycle(kern_deaths_seats), series = "Trend") +
+  forecast::autolayer(forecast::seasadj(kern_deaths_seats), series = "Seasonally Adjusted") +
+  ggplot2::scale_color_manual(values = c("gray", "blue", "red"),
+                     breaks = c("Log-Transformed Data", "Seasonally Adjusted", "Trend")) +
+  ggplot2::labs(title = "Log-Percentages of Deaths per 10k per Month in Kern County",
+       y = "Log-Percentage", tag = "Figure A")
+```
+
+```{r appendix 2, fig.height=5}
+# plot of the transformed de-seasonalized LA deaths data
+forecast::autoplot(log(la_deaths_ts), series = "Log-Transformed Data") +
+  forecast::autolayer(forecast::trendcycle(la_deaths_seats), series = "Trend") +
+  forecast::autolayer(forecast::seasadj(la_deaths_seats), series = "Seasonally Adjusted") +
+  ggplot2::scale_color_manual(values = c("gray", "blue", "red"),
+                     breaks = c("Log-Transformed Data", "Seasonally Adjusted", "Trend")) +
+  ggplot2::labs(title = "Log-Percentages of Deaths per 10k per Month in Los Angeles County",
+       y = "Log-Percentage", tag = "Figure B")
+```
+
+```{r appendix 3}
+# AIC and BIC of different lags of ARDL model on Kern County data
+knitr::kable(kern_ardl_stats_per_k, booktabs = TRUE, align = rep("r", 3),
+             caption = "Model Selection Criteria for Kern County Deaths Data Regressed with Lags of AQI Data")
+```
+
+```{r appendix 4}
+# AIC and BIC of different lags of ARDL model on LA County data
+knitr::kable(la_ardl_stats_per_k, booktabs = TRUE, align = rep("r", 3),
+             caption = "Model Selection Criteria for Los Angeles County Deaths Data Regressed with Lags of AQI Data")
+```
+
+```{r appendix 5}
+# Kern County Regression Model 
+# Forecasted Deaths and Forecasted AQI
+
+# to add back trend, add observed log differenced values to past observed log values
+kern_aqi_forecasts_log_wo_diff = stats::window(log(kern_aqi_ts), start=c(2019, 01)) + kern_aqi_newdata$mean[1:12]
+# use forecasted data to add back trend to second half since there are no observed log values
+kern_aqi_forecasts_log_wo_diff = append(kern_aqi_forecasts_log_wo_diff, 
+                                        kern_aqi_forecasts_log_wo_diff + kern_aqi_newdata$mean[13:24])
+# remove log transformation
+kern_aqi_forecasts_values = exp(kern_aqi_forecasts_log_wo_diff)
+
+
+# LA County Regression Model 
+# Forecasted Deaths and Forecasted AQI
+
+# repeat above for la county data
+la_aqi_forecasts_log_wo_diff = stats::window(log(la_aqi_ts), start=c(2019, 01)) + la_aqi_newdata$mean[1:12]
+la_aqi_forecasts_log_wo_diff = append(la_aqi_forecasts_log_wo_diff, 
+                                        la_aqi_forecasts_log_wo_diff + la_aqi_newdata$mean[13:24])
+la_aqi_forecasts_values = exp(la_aqi_forecasts_log_wo_diff)
+
+
+# view forecasts in table format
+knitr::kable(base::rbind(base::cbind("Date" = base::rownames(base::data.frame(kern_deaths_autoarima_r)),
+                   "Regression Forecasted Deaths" = base::round(kern_deaths_regression_y, 6),
+                   "AQI" = base::round(kern_aqi_forecasts_values, 6),
+                   "Deaths Difference from Last Month" = c(NA, base::round(diff(kern_deaths_regression_y, lag=1), 6)),
+                   "AQI Difference from Last Month" = c(NA, base::round(diff(kern_aqi_forecasts_values, lag=1), 6)),
+                   "Regression Forecasted Deaths" = base::round(la_deaths_regression_y, 6),
+                   "AQI" = base::round(la_aqi_forecasts_values, 6), 
+                   "Deaths Difference from Last Month" = c(NA, base::round(diff(la_deaths_regression_y, lag=1), 6)),
+                   "AQI Difference from Last Month" = c(NA, base::round(diff(la_aqi_forecasts_values, lag=1), 6)))),
+             booktabs = TRUE, align = rep("r", 6),
+             caption = "Comparison of Forecasts from Regression Models") %>%
+  kableExtra::add_header_above(c(" " = 1, "Kern County" = 4, "Los Angeles County" = 4)) %>%
+  kableExtra::kable_styling(latex_options = c("scale_down")) %>%
+  kableExtra::landscape()
+```
+
+```{r appendix 8}
+# Forecasted Death Percentages
+# view forecasted values in table format
+knitr::kable(base::rbind(base::cbind("Date" = base::rownames(base::data.frame(kern_deaths_autoarima_r)),
+                   "Without AQI Data" = base::round(kern_deaths_autoarima_y, 6),
+                   "With AQI Data" = base::round(kern_deaths_regression_y, 6),
+                   "Absolute Difference" = abs(base::round(kern_deaths_autoarima_y-kern_deaths_regression_y, 6)),
+                   "Without AQI Data" = base::round(la_deaths_autoarima_y, 6),
+                   "With AQI Data" = base::round(la_deaths_regression_y, 6),
+                   "Absolute Difference" = abs(base::round(la_deaths_autoarima_y-la_deaths_regression_y, 6))),
+                   c("Average", "", "", base::round(mean(abs(kern_deaths_autoarima_y-kern_deaths_regression_y)), 6),
+                     "", "", base::round(mean(abs(la_deaths_autoarima_y-la_deaths_regression_y)), 6))),
+             booktabs = TRUE, align = rep("r", 6),
+             caption = "Comparison of Forecasts from Forecasting Models") %>%
+  kableExtra::kable_styling(latex_options = c("scale_down")) %>%
+  kableExtra::add_header_above(c(" " = 1, "Kern County" = 3, "Los Angeles County" = 3)) %>%
+  kableExtra::landscape()
+```
+
+```{r appendix 9}
+# view forecasted residuals in table format
+knitr::kable(base::rbind(base::cbind("Date" = base::rownames(base::data.frame(kern_deaths_autoarima_r)),
+                   "Without AQI Data" = base::round(kern_deaths_autoarima_r$mean, 6),
+                   "With AQI Data" = base::round(kern_deaths_regression_r, 6),
+                   "Absolute Difference" = abs(base::round(kern_deaths_autoarima_r$mean-kern_deaths_regression_r, 6)),
+                   "Without AQI Data" = base::round(la_deaths_autoarima_r$mean, 6),
+                   "With AQI Data" = base::round(la_deaths_regression_r, 6),
+                   "Absolute Difference" = abs(base::round(la_deaths_autoarima_r$mean-la_deaths_regression_r, 6))),
+                   c("Average", "", "", base::round(mean(abs(kern_deaths_autoarima_r$mean-kern_deaths_regression_r)), 6),
+                     "", "", base::round(mean(abs(la_deaths_autoarima_r$mean-la_deaths_regression_r)), 6))),
+             booktabs = TRUE, align = rep("r", 6),
+             caption = "Comparison of Residuals from Forecasting Models") %>%
+  kableExtra::kable_styling(latex_options = c("scale_down")) %>%
+  kableExtra::add_header_above(c(" " = 1, "Kern County" = 3, "Los Angeles County" = 3)) %>%
+  kableExtra::landscape()
+```
+
+\newpage
+
+## References
+\setlength{\parindent}{-0.2in}
+\setlength{\leftskip}{0.2in}
+\setlength{\parskip}{8pt}
+\noindent
+
+Perez, N. (2018) *Despite decades of cleanup, respiratory disease deaths plague California county*. Available at: https://www.ehn.org/chronic-respiratory-disease-california-2621765230.html
+
+Wang, T., Zhao, B., Liou, K.N., *et al.*. (2019) 'Mortality burdens in California due to air pollution attributable to local and nonlocal emissions', *Environment International*, 133 (Part B). Available at: https://doi.org/10.1016/j.envint.2019.105232
+
+World Health Organization. (2018) *9 out of 10 people worldwide breathe polluted air, but more countries are taking action*. Available at: https://www.who.int/news-room/detail/02-05-2018-9-out-of-10-people-worldwide-breathe-polluted-air-but-more-countries-are-taking-action
